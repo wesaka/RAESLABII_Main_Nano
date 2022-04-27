@@ -4,6 +4,10 @@
 #include <Adafruit_SSD1306.h>
 #include <PID_v1.h>
 #include <SoftwareSerial.h>
+#include <Servo.h>
+
+#include "RES_Smoothing_Data.h"
+#include "SimpleKalmanFilter.h"
 
 /*
  * Updated for using the arduino nano as command
@@ -30,9 +34,20 @@
 int lastCounter[2] = {0, 0};
 int currentPos[2] = {0, 0};
 int targetPos[2] = {0, 0};
+int joystick[3] = {0,0,0};
 
 int currentStateCLK[2];
 int lastStateCLK[2];
+
+/*
+ * Serial message definitions
+ */
+
+#define ATR_PROTOCOL_MAX_BUF_SIZE   64
+
+char msgBuf[ATR_PROTOCOL_MAX_BUF_SIZE];
+int msgBufPnt = 0;
+
 
 /*
  * Menu Strings
@@ -52,6 +67,7 @@ int lastStateCLK[2];
  * Timekeeping
 **/
 unsigned long timeForRPM = millis();
+unsigned long doEvery = millis();
 
 /*
  * TODO menu values are going to be done using strings - those ints were too convoluted
@@ -71,7 +87,7 @@ unsigned long timeForRPM = millis();
 #define PIN_WHEEL_ENCODER_CLK_RIGHT    3
 #define PIN_WHEEL_ENCODER_DT_RIGHT    5
 #define PIN_MOTOR_PWM_RIGHT    11
-#define PIN_MOTOR_IN0_RIGHT    10
+#define PIN_MOTOR_IN0_RIGHT    A0
 #define PIN_MOTOR_IN1_RIGHT    9
 
 #define PIN_WHEEL_ENCODER_CLK_LEFT    2
@@ -94,6 +110,39 @@ bool isIncreasing[2] = {true, true};
 unsigned long currentRPM[2];
 
 /*
+ * Scanner pins
+ */
+
+#define PIN_SONAR_PING              A3
+#define PIN_SONAR_ECHO              A2
+#define PIN_SERVO                   10
+
+#define MIN_SONAR_ANGLE      30
+#define MID_SONAR_ANGLE      90
+#define MAX_SONAR_ANGLE      150
+#define MAX_SONAR_VALUE       350      // e.g. 650 mm is max range
+#define STRID_SONAR_ANGLE     5
+
+// Scan variables
+
+const int numReadings = 10;
+
+SimpleKalmanFilter simpleKalmanFilter(2, 2, 0.01);
+
+// create servo object to control a servo
+Servo myServo;
+
+int readings[numReadings];      // the readings from the input
+int readIndex = 0;              // the index of the current reading
+int total = 0;                  // the running total
+int average = 0;                // the average
+
+int sonar[2][180];
+int sonarAngle  = 30;
+int sonarScanDirection = 0;
+float prev = 0.0; float now = 0.0; float alpha = 0.99;  float beta = 0.01;
+
+/*
  * PID
  */
 double pidSetpoint, pidInput, pidOutput;
@@ -101,16 +150,6 @@ double Kp = 2, Ki = 5, Kd = 1;
 
 PID pidR(&realSpeed[0], &pwmSpeed[0], &pidSetpoint, Kp, Ki, Kd, DIRECT);
 PID pidL(&realSpeed[1], &pwmSpeed[1], &pidSetpoint, Kp, Ki, Kd, DIRECT);
-
-/*
- * Control mode variables
- */
-#define CONTROL_STANDBY 0
-#define CONTROL_AUTO 1
-#define CONTROL_REMOTE 2
-
-// Start off in remote control
-int controlMode = CONTROL_REMOTE;
 
 /*
  * MPU
@@ -139,27 +178,17 @@ double getOdometer(int);
 
 void getEncoderCount(int);
 
+void handleScan();
+
+void handleJoystick(int xValue, int yValue);
+
 void handleSerialComm();
+
+bool checkMessage();
 
 void handleAsync();
 
-void handleBehavior();
-
-void autoMotor(int);
-
-void stopAll();
-
-void targetOdometer(double, int);
-
-void targetSpeed(double);
-
 void turn(float degrees);
-
-void doADonut();
-
-void handleEncoderTarget(int speed);
-
-void driveTo(int x, int y);
 
 /*
  * Main Arduino functions
@@ -167,9 +196,10 @@ void driveTo(int x, int y);
 
 SoftwareSerial sSerial = SoftwareSerial(13, 12);
 void setup() {
-    sSerial.begin(38400);
+    Serial.begin(9600);
+    sSerial.begin(9600);
 
-// Set encoder pins as inputs
+    // Set encoder pins as inputs
     pinMode(PIN_WHEEL_ENCODER_CLK_RIGHT, INPUT_PULLUP);
     pinMode(PIN_WHEEL_ENCODER_DT_RIGHT, INPUT);
     pinMode(PIN_WHEEL_ENCODER_CLK_LEFT, INPUT_PULLUP);
@@ -205,54 +235,40 @@ void setup() {
     // PID init
     pidR.SetMode(AUTOMATIC);
     pidL.SetMode(AUTOMATIC);
+
+    // Sonar Setting
+    pinMode(PIN_SONAR_PING, OUTPUT);
+    pinMode(PIN_SONAR_ECHO, INPUT);
+    myServo.attach(PIN_SERVO);
+    myServo.write(MID_SONAR_ANGLE);// attaches the servo on PIN_SERVO to the servo object and set middle position
+
+    // init for sonar reading
+    for (int i = 0; i < 180; i++) {
+        sonar[0][i] = 0; sonar[1][i] = 0;
+    }
 }
 
 void loop() {
     handleAsync();
 }
 
-unsigned long hundredMillis = millis();
 unsigned long oneMillis = millis();
-unsigned long tenMicros = micros();
+unsigned long hundredMillis = millis();
 
 void handleAsync() {
-    if (millis() > oneMillis + 10) {
+    if (millis() > oneMillis + 50) {
         oneMillis = millis();
 
         getEncoderCount(0);
         getEncoderCount(1);
         getRPM();
+        handleSerialComm();
+        handleJoystick(joystick[0], joystick[1]);
     }
-
 
     if (millis() > hundredMillis + 100) {
-        // Reset the global time variable to reflect now
         hundredMillis = millis();
-        //sSerial.println(hundredMillis);
-
-        // Handlers
-        handleSerialComm();
-        handleBehavior();
-        handleEncoderTarget(100);
-
-        // todo make an auto mode for testing for now
-    }
-}
-
-/**
- * This is the function that determines what the robot will do
- */
-
-void handleBehavior() {
-    switch (controlMode) {
-        case CONTROL_AUTO:
-            break;
-
-        case CONTROL_REMOTE:
-            break;
-
-        default:
-            break;
+        handleScan();
     }
 }
 
@@ -327,286 +343,226 @@ void getEncoderCount(int motor) {
     lastStateCLK[motor] = currentStateCLK[motor];
 }
 
-// Todo improve this, as this is going to be the main way to control the car, except when it is on auto mode
-String receiveSerialString() {
-    const int inputSize = 50;
-    char inputArray[inputSize];
-    static byte ndx = 0;
-    char endMarker = '\n';
-    char rc;
+void handleScan() {
+    // Servo motor position
+    if (sonarScanDirection == 0){ // increase scan angle
+        sonarAngle++;
+        if (sonarAngle >= 150) sonarScanDirection = 1;
+    }else{
+        sonarAngle--;
+        if (sonarAngle <= 30) sonarScanDirection = 0;
 
-    while (sSerial.available() > 0) {
-        rc = sSerial.read();
+    }
+    myServo.write(sonarAngle);
+    delay(20);
+    // sonar data sending
+    digitalWrite(PIN_SONAR_PING, LOW);
+    delayMicroseconds(2);
+    digitalWrite(PIN_SONAR_PING, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(PIN_SONAR_PING, LOW);
+    int tmpSonarValue = (pulseIn(PIN_SONAR_ECHO, HIGH,5000 ) / 29 / 2) * 5 ;   // mm
+    if (tmpSonarValue == 0) tmpSonarValue = MAX_SONAR_VALUE;
+    sonar[1][sonarAngle] = sonar[0][sonarAngle];
+    sonar[0][sonarAngle] = tmpSonarValue;
+    Serial.print("sonar ");
+    Serial.print(sonarAngle);
+    Serial.print(" ");
+    Serial.print(sonar[1][sonarAngle]);
+    Serial.print(" ");
+    Serial.println(sonar[0][sonarAngle]);
 
-        if (rc != endMarker) {
-            inputArray[ndx] = rc;
-            ndx++;
-            if (ndx >= inputSize) {
-                ndx = inputSize - 1;
-            }
+    // TODO perhaps change how the serial comms are made here
+}
+
+/**
+ * This is the main function that handles the direction we are moving to
+ * Checks the joystick variable and moves wherever it is pointing to
+ * Joystick values are organized into X, Y and SW
+ */
+ 
+int deadzone = 10;
+unsigned int xSpeed = 0, ySpeed = 0;
+
+/**
+ * This is the function that regulates where we want to go
+ * 1 is forward, -1 is backward, basically
+ *
+ * @param left
+ * @param right
+ */
+void motorRotation(int left, int right) {
+    digitalWrite(PIN_MOTOR_IN0_LEFT, left == 1 ? LOW : HIGH);
+    digitalWrite(PIN_MOTOR_IN1_LEFT, left == 1 ? HIGH : LOW);
+    digitalWrite(PIN_MOTOR_IN0_RIGHT, right == 1 ? LOW : HIGH);
+    digitalWrite(PIN_MOTOR_IN1_RIGHT, right == 1 ? HIGH : LOW);
+}
+
+void handleJoystick(int xValue, int yValue) {
+    if (yValue >= (512 + deadzone))//Forward
+    {
+        Serial.println("Forward");
+        ySpeed = (yValue - 512) / 2; // 0 - 255
+        if(xValue > (512 + deadzone)) //Left
+        {
+            Serial.println("Left");
+            xSpeed = (xValue - 512) / 2;
+            //analogWrite(LMF, ySpeed - xSpeed); analogWrite(RMF, ySpeed);
+            motorRotation(1, 1);
+            analogWrite(PIN_MOTOR_PWM_LEFT, ySpeed - xSpeed);
+            analogWrite(PIN_MOTOR_PWM_RIGHT, ySpeed);
+            //digitalWrite(LMR, LOW); digitalWrite(RMR, LOW);
         }
-        else {
-            inputArray[ndx] = '\0'; // terminate the string
-            ndx = 0;
+        else if (xValue < (512 - deadzone)) //Right
+        {
+            Serial.println("Right");
+            xSpeed = (512 - xValue) / 2;
+            //analogWrite(LMF, ySpeed); analogWrite(RMF, ySpeed - xSpeed);
+            motorRotation(1, 1);
+            analogWrite(PIN_MOTOR_PWM_LEFT, ySpeed);
+            analogWrite(PIN_MOTOR_PWM_RIGHT, ySpeed - xSpeed);
+            //digitalWrite(LMR, LOW); digitalWrite(RMR, LOW);
+        }
+        else
+        {
+            Serial.println("Just Forward");
+            //analogWrite(LMF, ySpeed); analogWrite(RMF, ySpeed);
+            motorRotation(1, 1);
+            analogWrite(PIN_MOTOR_PWM_LEFT, ySpeed);
+            analogWrite(PIN_MOTOR_PWM_RIGHT, ySpeed);
+            //digitalWrite(LMR, LOW); digitalWrite(RMR, LOW);
         }
     }
 
-    return {inputArray};
+    else if (yValue <= (512 - deadzone))//Reverse
+    {
+        Serial.println("Reverse");
+        ySpeed = (512 - yValue) / 2;
+        if(xValue > (512 + deadzone)) //Left
+        {
+            Serial.println("Left");
+            xSpeed = (xValue - 512) / 2;
+            //digitalWrite(LMF, LOW); digitalWrite(RMF, LOW);
+            //analogWrite(LMR, ySpeed - xSpeed); analogWrite(RMR, ySpeed);
+            motorRotation(-1, -1);
+            analogWrite(PIN_MOTOR_PWM_LEFT, ySpeed - xSpeed);
+            analogWrite(PIN_MOTOR_PWM_RIGHT, ySpeed);
+        }
+        else if (xValue < (512 - deadzone)) //Right
+        {
+            Serial.println("Right");
+            xSpeed = (512 - xValue) / 2;
+            //digitalWrite(LMF, LOW); digitalWrite(RMF, LOW);
+            //analogWrite(LMR, ySpeed); analogWrite(RMR, ySpeed - xSpeed);
+            motorRotation(-1, -1);
+            analogWrite(PIN_MOTOR_PWM_LEFT, ySpeed);
+            analogWrite(PIN_MOTOR_PWM_RIGHT, ySpeed - xSpeed);
+        }
+        else
+        {
+            Serial.println("Just reverse");
+            //digitalWrite(LMF, LOW); digitalWrite(RMF, LOW);
+            //analogWrite(LMR, ySpeed); analogWrite(RMR, ySpeed);
+            motorRotation(-1, -1);
+            analogWrite(PIN_MOTOR_PWM_LEFT, ySpeed);
+            analogWrite(PIN_MOTOR_PWM_RIGHT, ySpeed);
+        }
+    }
+
+    else // X is between 512 +- deadzone
+    {
+        if(xValue > (512 + deadzone)) // zero point turn Left
+        {
+            Serial.println("Zero point left");
+            //digitalWrite(LMF, LOW); analogWrite(RMF, xSpeed);
+            motorRotation(-1, 1);
+            analogWrite(PIN_MOTOR_PWM_LEFT, xSpeed);
+            analogWrite(PIN_MOTOR_PWM_RIGHT, xSpeed);
+            //digitalWrite(LMR, LOW); digitalWrite(RMR, LOW);
+        }
+        else if(xValue < (512 - deadzone))// zero point turn Right
+        {
+            Serial.println("Zero point right");
+            //analogWrite(LMF, xSpeed); digitalWrite(RMF, LOW);
+            motorRotation(1, -1);
+            analogWrite(PIN_MOTOR_PWM_LEFT, xSpeed);
+            analogWrite(PIN_MOTOR_PWM_RIGHT, xSpeed);
+            //digitalWrite(LMR, LOW); digitalWrite(RMR, LOW);
+        }
+        else
+        { // Full stop
+            analogWrite(PIN_MOTOR_PWM_RIGHT,0);
+            analogWrite(PIN_MOTOR_PWM_LEFT,0);
+        }
+    }
 }
 
 void handleSerialComm() {
-    /*
-     * This used for inputting data from serial
-     * Use with sSerial.readString()
-     * inputString.startsWith("whatever")
-     */
-
-    // TODO figure out what is messing with the OLED allocation
-
-    if (sSerial.available()) {
-        String option = sSerial.readString();
-//        Serial.println(option);
-
-        // Sanitize the string received if needed and set currentCommandString
-        // currentCommandString is the variable that holds the full "path" of what we should be doing
-        // First, check on what level we are, counting the number of '/' we have - not sure if I will really need this
-        int level = 0;
-        for (int i = 0; option[i]; i++)
-            if (option[i]=='/') level++;
-
-        currentCommandString = option;
-
-        // TODO finish this
-
-        if (currentCommandString.indexOf(MENU_MODE) != -1) {
-            // Manual mode check
-
-        } else if (currentCommandString.indexOf(MENU_REMOTE_CONTROL) != -1) {
-            // Manual mode check - remote controlled
-            controlMode = CONTROL_REMOTE;
-            sSerial.print("Control Remote Set");
-
-        } else if (currentCommandString.indexOf(MENU_AUTORUN) != -1) {
-            // Autorun mode check
-            controlMode = CONTROL_AUTO;
-            sSerial.print("Control Auto Set");
-
-        } else if (currentCommandString.indexOf(MENU_SPEEDOMETER) != -1) {
-            // If we want a speedometer
-            // Check if autorun or manual first
-
-        } else if (currentCommandString.indexOf(MENU_ODOMETER) != -1) {
-            // If we want the odometer
-            // Check if autorun or manual first
-            sSerial.print("Odometer right - ");
-            sSerial.println(getOdometer(0));
-            sSerial.print("Odometer left - ");
-            sSerial.println(getOdometer(1));
-
-        } else if (currentCommandString.indexOf(MENU_ORIENTATION) != -1) {
-            // If we want the orientation
-            // Check if autorun or manual first
-            mpu.Execute();
-            sSerial.print("AngX = ");
-            sSerial.print(mpu.GetAngX());
-            sSerial.print("  /  AngY = ");
-            sSerial.print(mpu.GetAngY());
-            sSerial.print("  /  AngZ = ");
-            sSerial.println(mpu.GetAngZ());
-
-        } else if (currentCommandString.indexOf(MENU_CURRENT_LOCATION) != -1) {
-            // If we want the current location
-            // Check if autorun or manual first
-
-        } else if (currentCommandString.indexOf(MENU_REMOTE_CONTROL_MESSAGE) != -1) {
-            // Get a message from serial
-
-        } else if (currentCommandString.indexOf(MENU_SYSTEM_INFO) != -1) {
-            char toWrite[100];
-            snprintf(toWrite, 100, "Current RPM: %lu R - %lu L\n"
-                                   "Current PWM: %f R - %f L\n"
-                                   "Current realSpeed (meters/minute): %f R - %f L\n"
-                                   "Current odometer reading : %f R - %f L\n",
-                     currentRPM[0], currentRPM[1],
-                     pwmSpeed[0], pwmSpeed[1],
-                     getSpeed(0), getSpeed(1),
-                     getOdometer(0), getOdometer(1));
-
-            sSerial.println(toWrite);
-
-            //IMU checking
-            sSerial.print("[");
-            mpu.Execute();
-            sSerial.print(mpu.GetAngX());
-            sSerial.print("  ");
-            sSerial.print(mpu.GetAngY());
-            sSerial.print("  ");
-            sSerial.print(mpu.GetAngZ());
-            sSerial.println("]");
+    //  digitalWrite(LED_BUILTIN, HIGH);
+//  if (Serial.available()){
+//    Serial.print("[");
+//    String msg = Serial.readStringUntil('\n\r');  // "Serial.readStringUntil('\n\r')" possiblly make a short delay if message didn't have '\r'"
+//    Serial.print(msg);
+//    Serial.println("]");
+//  }
+//  digitalWrite(LED_BUILTIN, LOW);
 
 
-            // Also have to check if PID is asked to change
-            if (currentCommandString.indexOf("P") != -1) {
-                Kp = option.substring(2).toDouble();
-            } else if (currentCommandString.indexOf("I") != -1) {
-                Ki = option.substring(2).toDouble();
-            } else if (currentCommandString.indexOf("D") != -1) {
-                Kd = option.substring(2).toDouble();
+    while (sSerial.available() > 0){
+        char tmpChar = sSerial.read();
+        if (msgBufPnt >= ATR_PROTOCOL_MAX_BUF_SIZE){
+            Serial.println("Message Overflow");
+            if ((tmpChar != '\n') || (tmpChar != '\r')){
+                msgBuf[0] = tmpChar;
+                msgBufPnt = 1;
             }
-        } else {
-            // It should reach here if it is not a "directory" change
-            if (currentCommandString.indexOf("Donut") != -1) {
-                doADonut();
-            } else if (currentCommandString.indexOf("Target") != -1 && controlMode == CONTROL_REMOTE) {
-                // Get the X and Y coordinates of the target
-                // The user should input the command in the bluetooth serial as
-                // TargetX123|Y123 - where 123 are the desired coordinates
-                int xValue = currentCommandString.substring(currentCommandString.indexOf("X") + 1, currentCommandString.indexOf("|")).toInt();
-                int yValue = currentCommandString.substring(currentCommandString.indexOf("Y") + 1, currentCommandString.length()).toInt();
-                sSerial.print("Routing to X Y");
-                sSerial.print(xValue);
-                sSerial.print(yValue);
-
-            } else if (currentCommandString.indexOf("Turn") != -1 && controlMode == CONTROL_REMOTE) {
-                // Turn a set amount of degrees inplace
-                // Expecting Turn:123 where 123 are the degrees
-                sSerial.print("Turning degrees: ");
-                sSerial.print(currentCommandString.substring(currentCommandString.indexOf(":") + 1, currentCommandString.length()));
-
-                float degrees = currentCommandString.substring(currentCommandString.indexOf(":") + 1, currentCommandString.length()).toFloat();
-                turn(degrees);
-
-            } else if (currentCommandString.indexOf("Stop") != -1 && controlMode == CONTROL_REMOTE) {
-                // Set the target to be the actual value
-                encoderTarget[0] = encoderCounter[0];
-                encoderTarget[1] = encoderCounter[1];
+        }else{
+            if ((tmpChar == '\n') || (tmpChar == '\r')){
+                msgBuf[msgBufPnt] = '\0';
+                checkMessage();
+                msgBufPnt = 0;
+            }else{
+                msgBuf[msgBufPnt] = tmpChar;
+                msgBufPnt++;
             }
         }
     }
 }
 
-/*
- * Actuators
- */
-
-void autoMotor(int motor) {
-    // Handle the increase in realSpeed automatically
-    int speedStep = isIncreasing[motor] ? 1 : -1;
-    pwmSpeed[motor] += speedStep;
-
-    if (pwmSpeed[motor] > 255) {
-        pwmSpeed[motor] = 255;
-        isIncreasing[motor] = false;
-        isCW[motor] = false;
-    }
-
-    if (pwmSpeed[motor] < 50) {
-        pwmSpeed[motor] = 50;
-        isIncreasing[motor] = true;
-        isCW[motor] = true;
-    }
-
-    int in1Address = (motor == 0) ? PIN_MOTOR_IN0_RIGHT : PIN_MOTOR_IN0_LEFT;
-    int in2Address = (motor == 0) ? PIN_MOTOR_IN1_RIGHT : PIN_MOTOR_IN1_LEFT;
-    int speedAddress = (motor == 0) ? PIN_MOTOR_PWM_RIGHT : PIN_MOTOR_PWM_LEFT;
-
-    if (isCW[motor]) {
-        digitalWrite(in1Address, HIGH);
-        digitalWrite(in2Address, LOW);
-    } else {
-        digitalWrite(in1Address, LOW);
-        digitalWrite(in2Address, HIGH);
-    }
-
-    analogWrite(speedAddress, pwmSpeed[motor]);
-
-//    sSerial.print("Current realSpeed: ");
-//    sSerial.println(realSpeed);
-}
-
-void stopAll() {
-    analogWrite(PIN_MOTOR_PWM_RIGHT , 0);
-    analogWrite(PIN_MOTOR_PWM_LEFT , 0);
-}
-
-/**
- * This functions controls the wheel to run at full realSpeed until reaches the desired odometer
- *
- * @param odometerReading The target total distance traveled
- */
-void targetOdometer(double odometerReading, int side) {
-    if (odometerReading <= odometer[side]) {
-        analogWrite((side == 0) ? PIN_MOTOR_PWM_RIGHT : PIN_MOTOR_PWM_LEFT, 0);
-    } else {
-        digitalWrite((side == 0) ? PIN_MOTOR_IN0_RIGHT : PIN_MOTOR_IN0_LEFT, HIGH);
-        digitalWrite((side == 0) ? PIN_MOTOR_IN1_RIGHT : PIN_MOTOR_IN1_LEFT, LOW);
-        analogWrite((side == 0) ? PIN_MOTOR_PWM_RIGHT : PIN_MOTOR_PWM_LEFT, 255);
-    }
-}
-
-/**
- * The function that when called sets the robot to run at a certain realSpeed
- *
- * @param speedReading Accepts the realSpeed value to which you want the robot to maintain
- */
-void targetSpeed(double speedReading) {
-    //digitalWrite(M_STBY, HIGH); // STDBY is bound to 5v
-    digitalWrite(PIN_MOTOR_IN0_RIGHT, HIGH);
-    digitalWrite(PIN_MOTOR_IN1_RIGHT, LOW);
-    digitalWrite(PIN_MOTOR_IN0_LEFT, HIGH);
-    digitalWrite(PIN_MOTOR_IN1_LEFT, LOW);
-
-    for (int i = 0; i < 2; i++) {
-        // Ramp up the realSpeed until we hit the desired value
-        // Use PID for that
-        pidSetpoint = speedReading;
-
-        realSpeed[i] = getSpeed(i);
-        (i == 0 ? pidR : pidL).Compute();
-        analogWrite((i == 0) ? PIN_MOTOR_PWM_RIGHT : PIN_MOTOR_PWM_LEFT, pwmSpeed[i]);
-    }
-
-}
-
-void doADonut() {
-
-}
-
-/**
- * Use this function to manually set how many counts you want the motor in question to work to
- *
- * @param motor 0 Right - 1 Left
- * @param count How many more counts to drive to
- * @param speed How fast?
- */
-void handleEncoderTarget(int speed) {
-    for (int i = 0; i < 2; i++) {
-        int pinSpeed = (i == 0) ? PIN_MOTOR_PWM_RIGHT : PIN_MOTOR_PWM_LEFT;
-        int toGo = encoderTarget[i] > encoderCounter[i] ?  encoderTarget[i] - encoderCounter[i] : encoderCounter[i] - encoderTarget[i];
-
-        //TODO figure out a way to reliably stop the motor when we get where we want
-        if (toGo <= 2) {
-            encoderTarget[i] = encoderCounter[i];
-            analogWrite(pinSpeed, 0);
-        } else {
-            analogWrite(pinSpeed, speed);
-
-            int pinIn1 = (i == 0) ? PIN_MOTOR_IN0_RIGHT : PIN_MOTOR_IN0_LEFT;
-            int pinIn2 = (i == 0) ? PIN_MOTOR_IN1_RIGHT : PIN_MOTOR_IN1_LEFT;
-
-            int count = encoderTarget[i] - encoderCounter[i];
-            if (count > 0) {
-                // Forwards
-                digitalWrite(pinIn1, HIGH);
-                digitalWrite(pinIn2, LOW);
-
-            } else if (count < 0) {
-                // Backwards
-                digitalWrite(pinIn1, LOW);
-                digitalWrite(pinIn2, HIGH);
-
+bool checkMessage() {
+//  Serial.println(msgBuf);
+    char *p = msgBuf;
+    String str;
+    int cnt = 0;
+// while ((str = strtok_r(p, ";", &p)) != NULL) // delimiter is the semicolon
+    str = strtok_r(p, ";", &p);
+    //Serial.println(str);
+    if (str == "Joystick") {
+        while ((str = strtok_r(p, ";", &p)) != nullptr) {
+            if (cnt == 0) {          //joy x value
+                joystick[0] = str.toInt();
+            } else if (cnt == 1) {    //joy y value
+                joystick[1] = str.toInt();
+            } else if (cnt == 2) {    //joy sw value
+                joystick[2] = str.toInt();
             }
+            cnt++;
         }
+//        Serial.println("Joy ");
+//        Serial.print(joystick[0]);
+//        Serial.print(" ");
+//        Serial.print(joystick[1]);
+//        Serial.print(" ");
+//        Serial.println(joystick[2]);
+    } else if (str == "Command") {
+
+    } else if (str == "Message") {
+        while ((str = strtok_r(p, ";", &p)) != nullptr) {
+            Serial.print("[");
+            Serial.print(str);
+            Serial.println("]");
+        }
+
     }
 }
 
@@ -621,8 +577,6 @@ void handleEncoderTarget(int speed) {
  * @param degrees How many degrees you want it to turn inplace - trig circle, it works like that
  */
 void turn(float degrees) {
-    sSerial.print("This is indeed the last version...\n");
-
     // First, get how many degrees and choose which way to turn
     int direction = 1;
     float degreesToTurn = degrees;
@@ -637,20 +591,4 @@ void turn(float degrees) {
     int numberOfCounts = floor(degreesToTurn / 5.14) * direction;
     encoderTarget[0] = (encoderCounter[0] + numberOfCounts);
     encoderTarget[1] = (encoderCounter[1] + (numberOfCounts * -1));
-}
-
-/**
- * This is the main function that drives the robot
- * I have defined that 1 unit in any direction is a full revolution of the wheel.
- * For now it will drive in a straight line, curves and stuff might be split into smaller sections
- * Imagine that the robot is at the center of a XY plan
- * And you're looking at it from a top down view
- * Positive X is wherever the robot is looking at
- * IMU is not reliable enough for setting this :(
- *
- * @param x X position to drive to
- * @param y Y position to drive to
- */
-void driveTo(int x, int y) {
-
 }
