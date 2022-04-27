@@ -188,8 +188,6 @@ bool checkMessage();
 
 void handleAsync();
 
-void turn(float degrees);
-
 /*
  * Main Arduino functions
  */
@@ -564,31 +562,4 @@ bool checkMessage() {
         }
 
     }
-}
-
-/**
- * This is the turning function. It turns the thing
- * Here's the deal, I do it using the encoder count, and keeping in mind that for approx 30 counts
- * we have a full wheel turn, and when the wheel does one full turn it travels 225mm
- * For half a turn (180 degrees), both wheels have to travel 262mm - so this is approx equal to 35 counts
- * This is the maximum it turns, so we have to calculate the values in the middle
- * Each count is approx equal to 5 degrees
- *
- * @param degrees How many degrees you want it to turn inplace - trig circle, it works like that
- */
-void turn(float degrees) {
-    // First, get how many degrees and choose which way to turn
-    int direction = 1;
-    float degreesToTurn = degrees;
-    if (degrees > 180) {
-        direction = -1;
-        degreesToTurn = degrees - 180;
-    }
-
-    sSerial.print("Turning ");
-    sSerial.println(degreesToTurn);
-
-    int numberOfCounts = floor(degreesToTurn / 5.14) * direction;
-    encoderTarget[0] = (encoderCounter[0] + numberOfCounts);
-    encoderTarget[1] = (encoderCounter[1] + (numberOfCounts * -1));
 }
