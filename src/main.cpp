@@ -8,6 +8,7 @@
 
 #include "RES_Smoothing_Data.h"
 #include "SimpleKalmanFilter.h"
+#include "SimpleDeadReckoning.h"
 
 /*
  * Updated for using the arduino nano as command
@@ -29,17 +30,6 @@
  */
 
 /*
- * Global Variables
-**/
-int lastCounter[2] = {0, 0};
-int currentPos[2] = {0, 0};
-int targetPos[2] = {0, 0};
-int joystick[3] = {0,0,0};
-
-int currentStateCLK[2];
-int lastStateCLK[2];
-
-/*
  * Serial message definitions
  */
 
@@ -48,35 +38,15 @@ int lastStateCLK[2];
 char msgBuf[ATR_PROTOCOL_MAX_BUF_SIZE];
 int msgBufPnt = 0;
 
-
-/*
- * Menu Strings
- */
-
-#define MENU_MODE "Mode"
-#define MENU_AUTORUN "Autorun"
-#define MENU_REMOTE_CONTROL "Remote-Control"
-#define MENU_SPEEDOMETER "Speedometer"
-#define MENU_ODOMETER "Odometer"
-#define MENU_ORIENTATION "Orientation"
-#define MENU_CURRENT_LOCATION "Current-Location"
-#define MENU_REMOTE_CONTROL_MESSAGE "Remote-Control-Message"
-#define MENU_SYSTEM_INFO "System-Info"
-
 /*
  * Timekeeping
 **/
-unsigned long timeForRPM = millis();
-unsigned long doEvery = millis();
+long cTime = 0;     // current time of each iteration
 
 /*
- * TODO menu values are going to be done using strings - those ints were too convoluted
- * Possible values:
- * [Mode]  System-Info | Remote-Control | Autorun
- * [Mode/Autorun] Speedmeter (X m/h) | Odometer |  Orentation | Current Location x,y |
- * [Mode/Remote-Control] Speedmeter (X m/h) | Odometer | Orentation | Current Location x,y | Remote-Control-Message
- * [Mode/System-Info ] Wheel-Diameter | Distance Between two wheels
+ * Joystick variable saving
  */
+int joystick[3] = {0,0,0};
 
 #define SPACE "   "
 
@@ -96,18 +66,19 @@ unsigned long doEvery = millis();
 #define PIN_MOTOR_IN0_LEFT    7
 #define PIN_MOTOR_IN1_LEFT    8
 
-// Right is 0, Left is 1
-int encoderCounter[2] = {0, 0}; // Just to keep in mind that one revolution is approx 30 "counts"
-int encoderTarget[2] = {0, 0};
+int prevLeftCLK, prevLeftDT, nowLeftCLK, nowLeftDT = 0;
+int prevRightCLK, prevRightDT, nowRightCLK, nowRightDT = 0;
 
-bool isCW[2] = {true, true};
+//lCounter increases going forward, while rCounter decreases going forward
+long lCounter, rCounter = 0;
+long lastlCounter, lastrCounter = 0;
+float cTheta, xLocation, yLocation = 0;
 
-double odometer[2] = {0.0, 0.0};
+SimpleDeadReckoning mySDR( 104.0, 3.39, 13.0, 0);   // encoder values per one rotation,  wheel radius, distance between two wheels, unit (cm)
+float thetaOffset = 0.0;
+
 double pwmSpeed[2] = {1.0, 1.0};
 double realSpeed[2] = {0.0, 0.0};
-bool isIncreasing[2] = {true, true};
-
-unsigned long currentRPM[2];
 
 /*
  * Scanner pins
@@ -158,25 +129,8 @@ PID pidL(&realSpeed[1], &pwmSpeed[1], &pidSetpoint, Kp, Ki, Kd, DIRECT);
 MPU6050 mpu(Wire);
 
 /*
- * Task variables
- */
-String currentCommandString = "";
-
-#define TARGET_SPEED 1
-#define TARGET_ODOMETER 2
-
-
-/*
  * Function declarations
  */
-
-void getRPM();
-
-double getSpeed(int);
-
-double getOdometer(int);
-
-void getEncoderCount(int);
 
 void handleScan();
 
@@ -184,7 +138,13 @@ void handleJoystick(int xValue, int yValue);
 
 void handleSerialComm();
 
+void handleLocalization();
+
 bool checkMessage();
+
+void checkLeftEncoder();
+
+void checkRightEncoder();
 
 void handleAsync();
 
@@ -197,11 +157,15 @@ void setup() {
     Serial.begin(9600);
     sSerial.begin(9600);
 
-    // Set encoder pins as inputs
-    pinMode(PIN_WHEEL_ENCODER_CLK_RIGHT, INPUT_PULLUP);
-    pinMode(PIN_WHEEL_ENCODER_DT_RIGHT, INPUT);
+    // Wheel Encoder Setting
     pinMode(PIN_WHEEL_ENCODER_CLK_LEFT, INPUT_PULLUP);
-    pinMode(PIN_WHEEL_ENCODER_DT_LEFT, INPUT);
+    pinMode(PIN_WHEEL_ENCODER_CLK_RIGHT, INPUT_PULLUP);
+    pinMode(PIN_WHEEL_ENCODER_DT_LEFT, INPUT_PULLUP);
+    pinMode(PIN_WHEEL_ENCODER_DT_RIGHT, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(PIN_WHEEL_ENCODER_CLK_LEFT), checkLeftEncoder, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_WHEEL_ENCODER_DT_LEFT), checkLeftEncoder, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_WHEEL_ENCODER_CLK_RIGHT), checkRightEncoder, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_WHEEL_ENCODER_DT_RIGHT), checkRightEncoder, CHANGE);
 
     // Set up motor pins - A
     pinMode(PIN_MOTOR_PWM_RIGHT, OUTPUT);
@@ -212,10 +176,6 @@ void setup() {
     pinMode(PIN_MOTOR_PWM_LEFT, OUTPUT);
     pinMode(PIN_MOTOR_IN0_LEFT, OUTPUT);
     pinMode(PIN_MOTOR_IN1_LEFT, OUTPUT);
-
-    // Read the initial state of CLK
-    lastStateCLK[0] = digitalRead(PIN_WHEEL_ENCODER_CLK_RIGHT);
-    lastStateCLK[1] = digitalRead(PIN_WHEEL_ENCODER_CLK_LEFT);
 
     // IMU init
     //mpu.Initialize();
@@ -257,88 +217,17 @@ void handleAsync() {
     if (millis() > oneMillis + 50) {
         oneMillis = millis();
 
-        getEncoderCount(0);
-        getEncoderCount(1);
-        getRPM();
         handleSerialComm();
         handleJoystick(joystick[0], joystick[1]);
-    }
-
-    if (millis() > hundredMillis + 100) {
-        hundredMillis = millis();
         handleScan();
-    }
-}
-
-void getRPM() {
-    /*
-     * To calculate the RPM I'll use 1 revolution of the wheel, that is approx 30 in the "encoderCounter"
-     * Since every 30 the wheel does one revolution, but that's not exact :/
-     */
-
-    //sSerial.println(encoderCounter);
-
-    for (int i = 0; i < 2; i++) {
-        int counterResult = 0;
-
-        if (encoderCounter[i] > lastCounter[i]) {
-            counterResult = encoderCounter[i] - lastCounter[i];
-        } else if (encoderCounter[i] < lastCounter[i]) {
-            counterResult = lastCounter[i] - encoderCounter[i];
-        }
-
-        if (counterResult == 0) {
-            currentRPM[i] = 0;
-
-        } else if (counterResult >= 30) {
-            // 1 revolution have passed
-            lastCounter[i] = encoderCounter[i];
-
-            // Add it to the odometer
-            odometer[i] += 0.215;
-
-            // Get the time it took
-            unsigned long elapsedTime = millis() - timeForRPM;
-
-            timeForRPM = millis();
-
-            currentRPM[i] = (1 * (60000 / elapsedTime));
-        }
+        handleLocalization();
     }
 
-}
-
-double getSpeed(int motor) {
-    // Returns in meters/hour
-    return (0.215 * (float) currentRPM[motor]) * 60;
-}
-
-double getOdometer(int motor) {
-    return odometer[motor]; // Returns in total meters traveled
-}
-
-void getEncoderCount(int motor) {
-    // Read the current state of CLK
-    currentStateCLK[motor] = digitalRead((motor == 0) ? PIN_WHEEL_ENCODER_CLK_RIGHT : PIN_WHEEL_ENCODER_CLK_LEFT);
-
-    // If last and current state of CLK are different, then pulse occurred
-    // React to only 1 state change to avoid double count
-    if (currentStateCLK[motor] != lastStateCLK[motor] && currentStateCLK[motor] == 1) {
-
-        // If the DT state is different than the CLK state then
-        // the encoder is rotating CCW so decrement
-        if (digitalRead((motor == 0) ? PIN_WHEEL_ENCODER_DT_RIGHT : PIN_WHEEL_ENCODER_DT_LEFT) != currentStateCLK[motor]) {
-            encoderCounter[motor] += (-1 + (2 * motor)) ;
-
-        } else {
-            // Encoder is rotating CW so increment
-            encoderCounter[motor] += (1 - (2 * motor));
-
-        }
+    if (millis() > hundredMillis + 20) {
+        hundredMillis = millis();
+        checkLeftEncoder();
+        checkRightEncoder();
     }
-
-    // Remember last CLK state
-    lastStateCLK[motor] = currentStateCLK[motor];
 }
 
 void handleScan() {
@@ -352,7 +241,7 @@ void handleScan() {
 
     }
     myServo.write(sonarAngle);
-    delay(20);
+    //delay(20);
     // sonar data sending
     digitalWrite(PIN_SONAR_PING, LOW);
     delayMicroseconds(2);
@@ -399,11 +288,11 @@ void motorRotation(int left, int right) {
 void handleJoystick(int xValue, int yValue) {
     if (yValue >= (512 + deadzone))//Forward
     {
-        Serial.println("Forward");
+        //Serial.println("Forward");
         ySpeed = (yValue - 512) / 2; // 0 - 255
         if(xValue > (512 + deadzone)) //Left
         {
-            Serial.println("Left");
+            //Serial.println("Left");
             xSpeed = (xValue - 512) / 2;
             //analogWrite(LMF, ySpeed - xSpeed); analogWrite(RMF, ySpeed);
             motorRotation(1, 1);
@@ -413,7 +302,7 @@ void handleJoystick(int xValue, int yValue) {
         }
         else if (xValue < (512 - deadzone)) //Right
         {
-            Serial.println("Right");
+            //Serial.println("Right");
             xSpeed = (512 - xValue) / 2;
             //analogWrite(LMF, ySpeed); analogWrite(RMF, ySpeed - xSpeed);
             motorRotation(1, 1);
@@ -423,7 +312,7 @@ void handleJoystick(int xValue, int yValue) {
         }
         else
         {
-            Serial.println("Just Forward");
+            //Serial.println("Just Forward");
             //analogWrite(LMF, ySpeed); analogWrite(RMF, ySpeed);
             motorRotation(1, 1);
             analogWrite(PIN_MOTOR_PWM_LEFT, ySpeed);
@@ -434,11 +323,11 @@ void handleJoystick(int xValue, int yValue) {
 
     else if (yValue <= (512 - deadzone))//Reverse
     {
-        Serial.println("Reverse");
+        //Serial.println("Reverse");
         ySpeed = (512 - yValue) / 2;
         if(xValue > (512 + deadzone)) //Left
         {
-            Serial.println("Left");
+            //Serial.println("Left");
             xSpeed = (xValue - 512) / 2;
             //digitalWrite(LMF, LOW); digitalWrite(RMF, LOW);
             //analogWrite(LMR, ySpeed - xSpeed); analogWrite(RMR, ySpeed);
@@ -448,7 +337,7 @@ void handleJoystick(int xValue, int yValue) {
         }
         else if (xValue < (512 - deadzone)) //Right
         {
-            Serial.println("Right");
+            //Serial.println("Right");
             xSpeed = (512 - xValue) / 2;
             //digitalWrite(LMF, LOW); digitalWrite(RMF, LOW);
             //analogWrite(LMR, ySpeed); analogWrite(RMR, ySpeed - xSpeed);
@@ -458,7 +347,7 @@ void handleJoystick(int xValue, int yValue) {
         }
         else
         {
-            Serial.println("Just reverse");
+            //Serial.println("Just reverse");
             //digitalWrite(LMF, LOW); digitalWrite(RMF, LOW);
             //analogWrite(LMR, ySpeed); analogWrite(RMR, ySpeed);
             motorRotation(-1, -1);
@@ -471,7 +360,7 @@ void handleJoystick(int xValue, int yValue) {
     {
         if(xValue > (512 + deadzone)) // zero point turn Left
         {
-            Serial.println("Zero point left");
+            //Serial.println("Zero point left");
             //digitalWrite(LMF, LOW); analogWrite(RMF, xSpeed);
             motorRotation(-1, 1);
             analogWrite(PIN_MOTOR_PWM_LEFT, xSpeed);
@@ -480,7 +369,7 @@ void handleJoystick(int xValue, int yValue) {
         }
         else if(xValue < (512 - deadzone))// zero point turn Right
         {
-            Serial.println("Zero point right");
+            //Serial.println("Zero point right");
             //analogWrite(LMF, xSpeed); digitalWrite(RMF, LOW);
             motorRotation(1, -1);
             analogWrite(PIN_MOTOR_PWM_LEFT, xSpeed);
@@ -495,6 +384,26 @@ void handleJoystick(int xValue, int yValue) {
     }
 }
 
+void handleLocalization() {
+    cTime = millis();
+
+    mpu.Execute();
+    cTheta = mpu.GetAngZ()- thetaOffset;
+    mySDR.updateLocation(lCounter, rCounter, cTheta);
+    Serial.print("path;");
+    Serial.print(mySDR.getXLocation());
+    Serial.print(";");
+    Serial.print(mySDR.getYLocation());
+    Serial.print("\r\n");
+
+    sSerial.print("path;");
+    sSerial.print(mySDR.getXLocation());
+    sSerial.print(";");
+    sSerial.print(mySDR.getYLocation());
+    sSerial.print("\r\n");
+    //delay(100);
+}
+
 void handleSerialComm() {
     //  digitalWrite(LED_BUILTIN, HIGH);
 //  if (Serial.available()){
@@ -504,6 +413,16 @@ void handleSerialComm() {
 //    Serial.println("]");
 //  }
 //  digitalWrite(LED_BUILTIN, LOW);
+
+    if (rCounter != lastrCounter || lCounter != lastlCounter) {
+        Serial.print("Encoder right ");
+        Serial.print(rCounter);
+        Serial.print("; Encoder left ");
+        Serial.println(lCounter);
+
+        lastlCounter = lCounter;
+        lastrCounter = rCounter;
+    }
 
 
     while (sSerial.available() > 0){
@@ -561,5 +480,71 @@ bool checkMessage() {
             Serial.println("]");
         }
 
+    }
+}
+
+void checkLeftEncoder(){
+    prevLeftCLK = nowLeftCLK;
+    prevLeftDT = nowLeftDT;
+    nowLeftCLK = digitalRead(PIN_WHEEL_ENCODER_CLK_LEFT);
+    nowLeftDT = digitalRead(PIN_WHEEL_ENCODER_DT_LEFT);
+    if ((prevLeftCLK == 0) && (prevLeftDT == 0)){
+        if ((nowLeftCLK == 0) && (nowLeftDT == 1)){
+            lCounter++;
+        }else if ((nowLeftCLK == 1) && (nowLeftDT == 0)){
+            lCounter--;
+        }
+    }else if ((prevLeftCLK == 0) && (prevLeftDT == 1)){
+        if ((nowLeftCLK == 0) && (nowLeftDT == 0)){
+            lCounter--;
+        }else if ((nowLeftCLK == 1) && (nowLeftDT == 1)){
+            lCounter++;
+        }
+    }else if ((prevLeftCLK == 1) && (prevLeftDT == 0)){
+        if ((nowLeftCLK == 0) && (nowLeftDT == 0)){
+            lCounter++;
+        }else if ((nowLeftCLK == 1) && (nowLeftDT == 1)){
+            lCounter--;
+        }
+    }else if ((prevLeftCLK == 1) && (prevLeftDT == 1)){
+        if ((nowLeftCLK == 0) && (nowLeftDT == 1)){
+            lCounter--;
+        }else if ((nowLeftCLK == 1) && (nowLeftDT == 0)){
+            lCounter++;
+        }
+    }
+}
+
+
+
+void checkRightEncoder(){
+    prevRightCLK = nowRightCLK;
+    prevRightDT = nowRightDT;
+    nowRightCLK = digitalRead(PIN_WHEEL_ENCODER_CLK_RIGHT);
+    nowRightDT = digitalRead(PIN_WHEEL_ENCODER_DT_RIGHT);
+    if ((prevRightCLK == 0) && (prevRightDT == 0)){
+        if ((nowRightCLK == 0) && (nowRightDT == 1)){
+            rCounter++;
+        }else if ((nowRightCLK == 1) && (nowRightDT == 0)){
+            rCounter--;
+        }
+    }else if ((prevRightCLK == 0) && (prevRightDT == 1)){
+        if ((nowRightCLK == 0) && (nowRightDT == 0)){
+            rCounter--;
+        }else if ((nowRightCLK == 1) && (nowRightDT == 1)){
+            rCounter++;
+        }
+    }else if ((prevRightCLK == 1) && (prevRightDT == 0)){
+        if ((nowRightCLK == 0) && (nowRightDT == 0)){
+            rCounter++;
+        }else if ((nowRightCLK == 1) && (nowRightDT == 1)){
+            rCounter--;
+        }
+    }else if ((prevRightCLK == 1) && (prevRightDT == 1)){
+        if ((nowRightCLK == 0) && (nowRightDT == 1)){
+            rCounter--;
+        }else if ((nowRightCLK == 1) && (nowRightDT == 0)){
+            rCounter++;
+        }
     }
 }
