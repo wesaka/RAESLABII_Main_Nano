@@ -33,7 +33,7 @@
  * Serial message definitions
  */
 
-#define ATR_PROTOCOL_MAX_BUF_SIZE   64
+#define ATR_PROTOCOL_MAX_BUF_SIZE   128
 
 char msgBuf[ATR_PROTOCOL_MAX_BUF_SIZE];
 int msgBufPnt = 0;
@@ -46,13 +46,16 @@ long cTime = 0;     // current time of each iteration
 /*
  * Joystick variable saving
  */
-int joystick[3] = {0,0,0};
+int joystick[3] = {512,512,0};
 
 #define SPACE "   "
 
 /*
  * Encoder/Motor variables
  */
+
+#define LEFT_MOTOR 0
+#define RIGHT_MOTOR 1
 
 #define PIN_WHEEL_ENCODER_CLK_RIGHT    3
 #define PIN_WHEEL_ENCODER_DT_RIGHT    5
@@ -71,14 +74,15 @@ int prevRightCLK, prevRightDT, nowRightCLK, nowRightDT = 0;
 
 //lCounter increases going forward, while rCounter decreases going forward
 long lCounter, rCounter = 0;
-long lastlCounter, lastrCounter = 0;
+long lPrevCounter, rPrevCounter = 0;
+float lOdometer, rOdometer = 0;
+int lRPM, rRPM = 0;
 float cTheta, xLocation, yLocation = 0;
 
 SimpleDeadReckoning mySDR( 104.0, 3.39, 13.0, 0);   // encoder values per one rotation,  wheel radius, distance between two wheels, unit (cm)
 float thetaOffset = 0.0;
 
-double pwmSpeed[2] = {1.0, 1.0};
-double realSpeed[2] = {0.0, 0.0};
+double totalDistance;
 
 /*
  * Scanner pins
@@ -113,14 +117,6 @@ int sonarAngle  = 30;
 int sonarScanDirection = 0;
 float prev = 0.0; float now = 0.0; float alpha = 0.99;  float beta = 0.01;
 
-/*
- * PID
- */
-double pidSetpoint, pidInput, pidOutput;
-double Kp = 2, Ki = 5, Kd = 1;
-
-PID pidR(&realSpeed[0], &pwmSpeed[0], &pidSetpoint, Kp, Ki, Kd, DIRECT);
-PID pidL(&realSpeed[1], &pwmSpeed[1], &pidSetpoint, Kp, Ki, Kd, DIRECT);
 
 /*
  * MPU
@@ -138,13 +134,25 @@ void handleJoystick(int xValue, int yValue);
 
 void handleSerialComm();
 
-void handleLocalization();
+void sendData();
+
+void sendBTMessage(char *message);
 
 bool checkMessage();
 
 void checkLeftEncoder();
 
 void checkRightEncoder();
+
+double getLinearVelocity(int motor);
+
+double getAngularVelocity(int motor);
+
+float getOdometer(int motor);
+
+String getOrientation();
+
+void updateDistanceTraveled();
 
 void handleAsync();
 
@@ -154,8 +162,8 @@ void handleAsync();
 
 SoftwareSerial sSerial = SoftwareSerial(13, 12);
 void setup() {
-    Serial.begin(9600);
-    sSerial.begin(9600);
+    Serial.begin(38400);
+    sSerial.begin(38400);
 
     // Wheel Encoder Setting
     pinMode(PIN_WHEEL_ENCODER_CLK_LEFT, INPUT_PULLUP);
@@ -178,21 +186,10 @@ void setup() {
     pinMode(PIN_MOTOR_IN1_LEFT, OUTPUT);
 
     // IMU init
-    //mpu.Initialize();
+    mpu.Initialize();
 //    Serial.println("Calibrating MPU");
 //    mpu.Calibrate();
 //    Serial.println("MPU calibrated");
-//    Serial.println("Offsets:");
-//    Serial.print("GyroX Offset = ");
-//    Serial.println(mpu.GetGyroXOffset());
-//    Serial.print("GyroY Offset = ");
-//    Serial.println(mpu.GetGyroYOffset());
-//    Serial.print("GyroZ Offset = ");
-//    Serial.println(mpu.GetGyroZOffset());
-
-    // PID init
-    pidR.SetMode(AUTOMATIC);
-    pidL.SetMode(AUTOMATIC);
 
     // Sonar Setting
     pinMode(PIN_SONAR_PING, OUTPUT);
@@ -212,22 +209,26 @@ void loop() {
 
 unsigned long oneMillis = millis();
 unsigned long hundredMillis = millis();
+unsigned long thousandMillis = millis();
 
 void handleAsync() {
-    if (millis() > oneMillis + 50) {
+    if (millis() > oneMillis + 100) {
         oneMillis = millis();
 
         handleSerialComm();
         handleJoystick(joystick[0], joystick[1]);
-        handleScan();
-        handleLocalization();
+        //handleScan()
+        updateDistanceTraveled();
+        //sendData();
     }
 
-    if (millis() > hundredMillis + 20) {
-        hundredMillis = millis();
-        checkLeftEncoder();
-        checkRightEncoder();
-    }
+//    if (millis() > hundredMillis + 20) {
+//        hundredMillis = millis();
+//
+//        checkLeftEncoder();
+//        checkRightEncoder();
+//        updateDistanceTraveled();
+//    }
 }
 
 void handleScan() {
@@ -252,12 +253,12 @@ void handleScan() {
     if (tmpSonarValue == 0) tmpSonarValue = MAX_SONAR_VALUE;
     sonar[1][sonarAngle] = sonar[0][sonarAngle];
     sonar[0][sonarAngle] = tmpSonarValue;
-    Serial.print("sonar ");
-    Serial.print(sonarAngle);
-    Serial.print(" ");
-    Serial.print(sonar[1][sonarAngle]);
-    Serial.print(" ");
-    Serial.println(sonar[0][sonarAngle]);
+//    Serial.print("sonar ");
+//    Serial.print(sonarAngle);
+//    Serial.print(" ");
+//    Serial.print(sonar[1][sonarAngle]);
+//    Serial.print(" ");
+//    Serial.println(sonar[0][sonarAngle]);
 
     // TODO perhaps change how the serial comms are made here
 }
@@ -286,14 +287,20 @@ void motorRotation(int left, int right) {
 }
 
 void handleJoystick(int xValue, int yValue) {
+//    Serial.print("Handle Joystick called");
+//    Serial.print("X:");
+//    Serial.print(xValue);
+//    Serial.print(" Y:");
+//    Serial.println(yValue);
+
     if (yValue >= (512 + deadzone))//Forward
     {
         //Serial.println("Forward");
-        ySpeed = (yValue - 512) / 2; // 0 - 255
+        ySpeed = (yValue - 514) / 2; // 0 - 255
         if(xValue > (512 + deadzone)) //Left
         {
             //Serial.println("Left");
-            xSpeed = (xValue - 512) / 2;
+            xSpeed = (xValue - 514) / 2;
             //analogWrite(LMF, ySpeed - xSpeed); analogWrite(RMF, ySpeed);
             motorRotation(1, 1);
             analogWrite(PIN_MOTOR_PWM_LEFT, ySpeed - xSpeed);
@@ -303,7 +310,7 @@ void handleJoystick(int xValue, int yValue) {
         else if (xValue < (512 - deadzone)) //Right
         {
             //Serial.println("Right");
-            xSpeed = (512 - xValue) / 2;
+            xSpeed = (510 - xValue) / 2;
             //analogWrite(LMF, ySpeed); analogWrite(RMF, ySpeed - xSpeed);
             motorRotation(1, 1);
             analogWrite(PIN_MOTOR_PWM_LEFT, ySpeed);
@@ -320,15 +327,16 @@ void handleJoystick(int xValue, int yValue) {
             //digitalWrite(LMR, LOW); digitalWrite(RMR, LOW);
         }
     }
-
     else if (yValue <= (512 - deadzone))//Reverse
     {
-        //Serial.println("Reverse");
-        ySpeed = (512 - yValue) / 2;
+        ySpeed = (510 - yValue) / 2;
+//        Serial.print("Reverse - ");
+//        Serial.print(ySpeed);
+
         if(xValue > (512 + deadzone)) //Left
         {
             //Serial.println("Left");
-            xSpeed = (xValue - 512) / 2;
+            xSpeed = (xValue - 514) / 2;
             //digitalWrite(LMF, LOW); digitalWrite(RMF, LOW);
             //analogWrite(LMR, ySpeed - xSpeed); analogWrite(RMR, ySpeed);
             motorRotation(-1, -1);
@@ -338,7 +346,7 @@ void handleJoystick(int xValue, int yValue) {
         else if (xValue < (512 - deadzone)) //Right
         {
             //Serial.println("Right");
-            xSpeed = (512 - xValue) / 2;
+            xSpeed = (510 - xValue) / 2;
             //digitalWrite(LMF, LOW); digitalWrite(RMF, LOW);
             //analogWrite(LMR, ySpeed); analogWrite(RMR, ySpeed - xSpeed);
             motorRotation(-1, -1);
@@ -355,11 +363,11 @@ void handleJoystick(int xValue, int yValue) {
             analogWrite(PIN_MOTOR_PWM_RIGHT, ySpeed);
         }
     }
-
-    else // X is between 512 +- deadzone
+    else // Y is between 512 +- deadzone
     {
         if(xValue > (512 + deadzone)) // zero point turn Left
         {
+            xSpeed = (xValue - 514) / 2;
             //Serial.println("Zero point left");
             //digitalWrite(LMF, LOW); analogWrite(RMF, xSpeed);
             motorRotation(-1, 1);
@@ -369,6 +377,7 @@ void handleJoystick(int xValue, int yValue) {
         }
         else if(xValue < (512 - deadzone))// zero point turn Right
         {
+            xSpeed = (510 - xValue) / 2;
             //Serial.println("Zero point right");
             //analogWrite(LMF, xSpeed); digitalWrite(RMF, LOW);
             motorRotation(1, -1);
@@ -384,51 +393,61 @@ void handleJoystick(int xValue, int yValue) {
     }
 }
 
-void handleLocalization() {
+void sendData() {
     cTime = millis();
 
     mpu.Execute();
     cTheta = mpu.GetAngZ()- thetaOffset;
-    mySDR.updateLocation(lCounter, rCounter, cTheta);
-    Serial.print("path;");
-    Serial.print(mySDR.getXLocation());
-    Serial.print(";");
-    Serial.print(mySDR.getYLocation());
-    Serial.print("\r\n");
+    mySDR.updateLocation(lCounter, rCounter * -1, cTheta);
+    // Check if X or Y positions changed
+    if (mySDR.getXLocation() != xLocation || mySDR.getYLocation() != yLocation) {
+        //Update the correspondent locations
+        xLocation = mySDR.getXLocation();
+        yLocation = mySDR.getYLocation();
 
-    sSerial.print("path;");
-    sSerial.print(mySDR.getXLocation());
-    sSerial.print(";");
-    sSerial.print(mySDR.getYLocation());
-    sSerial.print("\r\n");
-    //delay(100);
+        // Print the updated locations
+//        Serial.print("path;");
+//        Serial.print(mySDR.getXLocation());
+//        Serial.print(";");
+//        Serial.print(mySDR.getYLocation());
+//        Serial.print("\r\n");
+
+        // Print the updated odometers
+//        Serial.print("odom L");
+//        Serial.print(mySDR.getLeftOdom());
+//        Serial.print(" R");
+//        Serial.print(mySDR.getRightOdom());
+//        Serial.print(" theta");
+//        Serial.print(mySDR.getTheta());
+//        Serial.print("\r\n");
+
+        char message[ATR_PROTOCOL_MAX_BUF_SIZE];
+        memset(message, '\0', ATR_PROTOCOL_MAX_BUF_SIZE);
+
+        snprintf(message, ATR_PROTOCOL_MAX_BUF_SIZE, "<path;%d;%d;orient;%s>\n",
+                 (int)xLocation,
+                 (int)yLocation,
+                 getOrientation().c_str());
+
+        //Serial.print(message);
+        sSerial.println(message);
+//        sendBTMessage(message);
+
+//        sSerial.print("path;");
+//        sSerial.print(mySDR.getXLocation());
+//        sSerial.print(";");
+//        sSerial.print(mySDR.getYLocation());
+//        sSerial.print("\r\n");
+    }
 }
 
 void handleSerialComm() {
-    //  digitalWrite(LED_BUILTIN, HIGH);
-//  if (Serial.available()){
-//    Serial.print("[");
-//    String msg = Serial.readStringUntil('\n\r');  // "Serial.readStringUntil('\n\r')" possiblly make a short delay if message didn't have '\r'"
-//    Serial.print(msg);
-//    Serial.println("]");
-//  }
-//  digitalWrite(LED_BUILTIN, LOW);
-
-    if (rCounter != lastrCounter || lCounter != lastlCounter) {
-        Serial.print("Encoder right ");
-        Serial.print(rCounter);
-        Serial.print("; Encoder left ");
-        Serial.println(lCounter);
-
-        lastlCounter = lCounter;
-        lastrCounter = rCounter;
-    }
-
-
+    // We are using sSerial to read incoming data
     while (sSerial.available() > 0){
         char tmpChar = sSerial.read();
+        Serial.write(tmpChar);
         if (msgBufPnt >= ATR_PROTOCOL_MAX_BUF_SIZE){
-            Serial.println("Message Overflow");
+            //Serial.println("Message Overflow");
             if ((tmpChar != '\n') || (tmpChar != '\r')){
                 msgBuf[0] = tmpChar;
                 msgBufPnt = 1;
@@ -446,41 +465,97 @@ void handleSerialComm() {
     }
 }
 
+void sendBTMessage(char *message) {
+    for (int i = 0; message[i] != '\0'; i++) {
+        Serial.write(message[i]);
+        delay(5);
+    }
+}
+
 bool checkMessage() {
-//  Serial.println(msgBuf);
-    char *p = msgBuf;
-    String str;
+    // Find the last occurrence of the < char in the string
+    char *p = strrchr(msgBuf, '<');
+    if (!p) {
+        // Not found
+        return false;
+    }
+
+    char *token;
     int cnt = 0;
-// while ((str = strtok_r(p, ";", &p)) != NULL) // delimiter is the semicolon
-    str = strtok_r(p, ";", &p);
-    //Serial.println(str);
-    if (str == "Joystick") {
-        while ((str = strtok_r(p, ";", &p)) != nullptr) {
-            if (cnt == 0) {          //joy x value
-                joystick[0] = str.toInt();
-            } else if (cnt == 1) {    //joy y value
-                joystick[1] = str.toInt();
-            } else if (cnt == 2) {    //joy sw value
-                joystick[2] = str.toInt();
-            }
-            cnt++;
+
+    // Read until a < is found - indicates the start of the command
+    // Also find the last < in the string
+    int mSize = 0;
+    while (mSize < ATR_PROTOCOL_MAX_BUF_SIZE) {
+        if (*p == '<') {
+            // Found the start of the command
+            // Advance one more char to get it ready for parsing the data
+            p++;
+            break;
         }
-//        Serial.println("Joy ");
-//        Serial.print(joystick[0]);
-//        Serial.print(" ");
-//        Serial.print(joystick[1]);
+        else p++;
+
+        mSize++;
+    }
+
+    if (mSize == ATR_PROTOCOL_MAX_BUF_SIZE) return false;
+
+    // Initialize a temporary buffer to hold the information
+    char tempBuf[ATR_PROTOCOL_MAX_BUF_SIZE] = {0};
+    int tempIdx = 0;
+
+    // Copy all the contents of the message until we hit the closing character to another string
+    while (*p != '>') {
+        // If '>' is never found, throw everything
+        if (*p == '\0') {
+            memset(msgBuf, 0, ATR_PROTOCOL_MAX_BUF_SIZE);
+            memset(tempBuf, 0, ATR_PROTOCOL_MAX_BUF_SIZE);
+            break;
+        }
+
+        tempBuf[tempIdx] = *p;
+        tempIdx++;
+        p++;
+    }
+
+    memset(msgBuf, 0, ATR_PROTOCOL_MAX_BUF_SIZE);
+
+// while ((token = strtok_r(p, ";", &p)) != NULL) // delimiter is the semicolon
+    token = strtok(tempBuf, ";");
+    //Serial.println(token);
+    if (strcmp(token, "Joystick") == 0) {
+        token = strtok(nullptr, ";");
+        while (token != nullptr) {
+            if (cnt == 0) {          //joy x value
+                joystick[0] = String(token).toInt();
+                printf("Joy 0 %d", joystick[0]);
+            } else if (cnt == 1) {    //joy y value
+                joystick[1] = String(token).toInt();
+            }
+//            else if (cnt == 2) {    //joy sw value
+//                joystick[2] = atoi(token);
+//            }
+            cnt++;
+            token = strtok(nullptr, ";");
+        }
+
+        Serial.println("Joy ");
+        Serial.print(joystick[0]);
+        Serial.print(" ");
+        Serial.print(joystick[1]);
 //        Serial.print(" ");
 //        Serial.println(joystick[2]);
-    } else if (str == "Command") {
+    } else if (token == "Command") {
 
-    } else if (str == "Message") {
-        while ((str = strtok_r(p, ";", &p)) != nullptr) {
-            Serial.print("[");
-            Serial.print(str);
-            Serial.println("]");
-        }
+    } else if (token == "Message") {
+//        while ((token = strtok_r(p, ";", &p)) != nullptr) {
+//            Serial.print("[");
+//            Serial.print(token);
+//            Serial.println("]");
+//        }
 
     }
+    return true;
 }
 
 void checkLeftEncoder(){
@@ -515,8 +590,6 @@ void checkLeftEncoder(){
     }
 }
 
-
-
 void checkRightEncoder(){
     prevRightCLK = nowRightCLK;
     prevRightDT = nowRightDT;
@@ -547,4 +620,96 @@ void checkRightEncoder(){
             rCounter++;
         }
     }
+}
+
+unsigned long rpmMillis = millis();
+void getRPM() {
+    /*
+     * To calculate the RPM I'll use 1 revolution of the wheel, that is approx 30 in the "encoderCounter"
+     * Since every 30 the wheel does one revolution, but that's not exact :/
+     */
+
+    //Serial.println(encoderCounter);
+
+    // Do two loops, one for the left side and one for the right side
+    // Updates the global value for the RPM in each side
+    for (int i = 0; i < 2; i++) {
+        long counterResult = 0;
+        long *encoderCount, *prevCount;
+        float *odometer;
+        int *rpm;
+
+        // First the left side
+        if (i == 0) {
+            encoderCount = &lCounter;
+            prevCount = &lPrevCounter;
+            odometer = &lOdometer;
+            rpm = &lRPM;
+        } else {
+            encoderCount = &rCounter;
+            prevCount = &rPrevCounter;
+            odometer = &rOdometer;
+            rpm = &rRPM;
+        };
+
+        if (*encoderCount > *prevCount) {
+            counterResult = *encoderCount - *prevCount;
+        } else if (*encoderCount < *prevCount) {
+            counterResult = *prevCount - *encoderCount;
+        }
+
+        if (counterResult == 0) {
+            *rpm = 0;
+
+        } else if (counterResult >= 30) {
+            // 1 revolution have passed
+            *prevCount = *encoderCount;
+
+            // Add it to the odometer
+            *odometer += 0.215;
+
+            // Get the time it took
+            unsigned long elapsedTime = millis() - rpmMillis;
+
+            rpmMillis = millis();
+
+            *rpm = (1 * (60000 / elapsedTime));
+        }
+    }
+
+}
+
+double getLinearVelocity(int motor) {
+    // Returns in meters/hour
+    if (motor == LEFT_MOTOR) return (0.215 * (float) lRPM) * 60;
+    else return (0.215 * (float) rRPM) * 60;
+}
+
+double getAngularVelocity(int motor) {
+    if (motor == LEFT_MOTOR) return (((float) lRPM)/60) * 2 * PI;
+    else return (((float) rRPM)/60) * 2 * PI;
+}
+
+float getOdometer(int motor) {
+    if (motor == LEFT_MOTOR) return lOdometer;
+    else return rOdometer;
+}
+
+String getOrientation() {
+    String orientation;
+    orientation += mpu.GetGyroXOffset();
+    orientation += ";";
+    orientation += mpu.GetGyroYOffset();
+    orientation += ";";
+    orientation += mpu.GetGyroZOffset();
+
+    return orientation;
+}
+
+float lastX, lastY = 0;
+void updateDistanceTraveled() {
+    float xDifference = abs(abs(lastX) - abs(xLocation));
+    float yDifference = abs(abs(lastY) - abs(yLocation));
+    double hypotenuse = sqrt(pow(xDifference, 2) + pow(yDifference, 2));
+    totalDistance += hypotenuse;
 }

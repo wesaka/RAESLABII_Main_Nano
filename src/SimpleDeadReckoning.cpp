@@ -54,15 +54,16 @@ void SimpleDeadReckoning::updateLocation(float argLeftEncoder, float argRightEnc
     _checkTime = millis();
 
 
-//  float vL = (((_leftOdom - _pLeftOdom)*_eValue) / ((_checkTime - _pCheckTime)/1000.0)) * (3.141592 / 180);
-//  float vR = (((_rightOdom - _pRightOdom )*_eValue)  / ((_checkTime - _pCheckTime)/1000.0)) *(3.141592 / 180) ;
-//  float wK = (vL - vR) / _wDistance;                              // encoder based delta theta calucation
-//  float deltaTheta = wK * ((_checkTime - _pCheckTime)/1000.0) ;   // encoder based delta theta calucation
+//    float vL = (((_leftOdom - _pLeftOdom)*_eValue) / ((_checkTime - _pCheckTime)/1000.0)) * (3.141592 / 180);
+//    float vR = (((_rightOdom - _pRightOdom )*_eValue)  / ((_checkTime - _pCheckTime)/1000.0)) *(3.141592 / 180) ;
+//    float wK = (vL - vR) / _wDistance;                              // encoder based delta theta calucation
+//    float deltaTheta = wK * ((_checkTime - _pCheckTime)/1000.0) ;   // encoder based delta theta calucation
 
     float vL = ((_leftOdom - _pLeftOdom)*_eValue) ;
     float vR = ((_rightOdom - _pRightOdom )*_eValue) ;
-    float vK = (vL + vR) / 2;
     float deltaTheta = _theta - _pTheta ;
+    float vK = (vL + vR) / 2;
+
     float deltaS = vK * _wRadius;
 
 
